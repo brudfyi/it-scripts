@@ -1,0 +1,185 @@
+<script>
+	$(document).ready(function(){
+
+    // Defaults
+    let default_info_html = '<p>Start by selecting a category type below. Use the <i>Message</i> section to communicate additional information, or if a particular option is not available.</p>'; // "header"
+    let default_message_text = 'Message'; // Text displayed above the message box
+    let default_message_box_text = ''; // Contents of the message box
+    let default_subject_text = ''; // Subject text
+
+    // New ticket button HMTL
+    let newTicketButton = '<section><div class="hf-custom-container button-container"><a href="/new/" class="ticket-button">Submit Ticket</a></div></section>';
+
+    // CUSTOM TEMPLATES
+    //
+    // cat_name: The case-sensitve name of the category for which the template will applies to
+    // info_html: The html placed at the top of the page, set to false to use default
+    // subject_text: The text that auto-populates the "subject" field, set to false to use default (empty)
+    // message_text: The text the appears above the mnessage box in place of the standard "Message" wordage, set to false to use default (Messsage)
+    // message_box_text: The text that auto-populates the message box, if user is not expected to enter anything in this box, set a value, otherwise set to false (empty and expects user input)
+    //
+    let custom_templates = [
+      {
+        "cat_name": "Onboarding Access Request",
+        "info_html": "Guidance:<br><ul><li>Access is granted after the new hires' Tech & Tools session or if the person is a contractor, their start date.</li><li>Complete as much of this ticket as possible to ensure the new hire has the access that they need from the start!</li><li>See the <a href=\"https://www.notion.so/dapperlabs/34eb4e48d2634714bca6c4a1a3862c21?v=d94324d3315546c392ed449d23ee6a16\" target=\"_blank\">RBAC Groups</a> document for guidance on which group membership to select, <b>choose a group the best describes the persons role (not a group that will be the most likey to grant the access required)</b>.</li><li>If no applicable group is listed for the persons role and group needs to be created, we would be grateful if you could request a new group by submitting a <b>New RBAC Group</b> ticket.</li></ul><p><b>NOTE:</b> If a contractor is handling sensitive data they will most likely be required to use a Mac which will need to be enrolled in our device management system prior to access being granted.</p>",
+        "subject_text": "Onboarding Access Request: [NAME AND START DATE]",
+        "message_text": "Additional Information",
+        'message_box_text': "Onboarding Access Request"
+      },
+      {
+        "cat_name": "Access Request",
+        "info_html": "Guidance:<br><ul><li>See the <a href=\"https://www.notion.so/dapperlabs/34eb4e48d2634714bca6c4a1a3862c21?v=d94324d3315546c392ed449d23ee6a16\" target=\"_blank\">RBAC Groups</a> document for guidance on which group membership to select, <b>choose a group the best describes your role or the other persons role</b>.</li><li>If you know that a particular group provides the access you require, please submit a <b>Add Users to RBAC Group</b> ticket instead (which will be much quicker!).</li><li>If no applicable group is listed for your role and group needs to be created, we would be grateful if you could request a new group by submitting a <b>New RBAC Group</b> ticket.</li></ul><p><b>NOTE:</b> If administrative access is required to resource or the ticket is likely to require approval, please ensure that your team lead is CC`d in this ticket.</p>",
+        "subject_text": "Access Request: [NAME]",
+        "message_text": "What type of access and permissions are needed and who requires this access?",
+        'message_box_text': false
+      },
+      {
+        "cat_name": "Add Users to RBAC Group",
+        "info_html": "<p><b>NOTE:</b> If this is a request for another person of group of people that have no yet been onboarded, submit a <b>Onboarding Access Request</b> ticket for each person instead.</p>",
+        "subject_text": "Add Users to RBAC Group: [NAME]",
+        "message_text": false,
+        'message_box_text': "Add Users to RBAC Group"
+      },
+      {
+        "cat_name": "New RBAC Group",
+        "info_html": "<p><b>IMPORTANT:</b> When requesting an RBAC group, please try not to make the group name and associated access levels too specific so that it only applies to one or two people. Conversly, please try not to make the group name and associated access levels too broad, which will help to avoid a scenario where people that may become members of this group in the future end up being granted access that they do not need.</p>",
+        "subject_text": "New RBAC Group: [RBAC GROUP NAME]",
+        "message_text": false,
+        'message_box_text': "New RBAC Group"
+      },
+      {
+        "cat_name": "New Slack Integration Request",
+        "info_html": "<p>Please install the Slack integration as normal. However, in order for the Slack integration to be activated, this ticket needs to be submitted so that the IT Team can reference.</p>",
+        "subject_text": "New Slack Integration Request: [SLACK INTEGRATION NAME]",
+        "message_text": false,
+        'message_box_text': "New Slack Integration Request"
+      },
+      {
+        "cat_name": "Device/Equipment Request",
+        "info_html": false,
+        "subject_text": "Device/Equipment Request: [NAME]",
+        "message_text": "Item(s) Requested",
+        'message_box_text': false
+      },
+      {
+        "cat_name": "Phone Request",
+        "info_html": false,
+        "subject_text": "Phone Request: [NAME]",
+        "message_text": false,
+        'message_box_text': "Phone Request"
+      },
+      {
+        "cat_name": "Zenniversary Gadget Request",
+        "info_html": false,
+        "subject_text": "Zenniversary Gadget Request: [NAME]",
+        "message_text": "Would you recommend that other team members try this gadget?",
+        'message_box_text': false
+      },
+      {
+        "cat_name": "Software Request",
+        "info_html": false,
+        "subject_text": "Software Request: [NAME OF SOFTWARE]",
+        "message_text": "Why is it needed?",
+        'message_box_text': false
+      },
+      {
+        "cat_name": "New Vendor Request",
+        "info_html": false,
+        "subject_text": "New Vendor Request: [NAME OF VENDOR]",
+        "message_text": false,
+        'message_box_text': "New Vendor Request"
+      },
+      {
+        "cat_name": "Working Outside of US/Canada",
+        "info_html": false,
+        "subject_text": "Working Outside of US/Canada: [NAME]",
+        "message_text": false,
+        'message_box_text': "Working Outside of US/Canada"
+      },
+      {
+        "cat_name": "Company Phone Plan Request",
+        "info_html": false,
+        "subject_text": "Company Phone Plan Request: [NAME]",
+        "message_text": false,
+        'message_box_text': "Company Phone Plan Request"
+      },
+      {
+        "cat_name": "IT Support Request",
+        "info_html": false,
+        "subject_text": false,
+        "message_text": "Details",
+        'message_box_text': false
+      },
+      {
+        "cat_name": "Add Users to Slack Channel(s)",
+        "info_html": false,
+        "subject_text": "Add Users to Slack Channel(s): [NAME(S)]",
+        "message_text": false,
+        'message_box_text': "Add Users to Slack Channel(s)"
+      },
+      {
+        "cat_name": "Add Users to RBAC Group",
+        "info_html": false,
+        "subject_text": "Add Users to RBAC Group: [NAME(S)]",
+        "message_text": false,
+        'message_box_text': "Add Users to RBAC Group"
+      },
+      {
+        "cat_name": "Email Invite Expired",
+        "info_html": false,
+        "subject_text": "Email Invite Expired: [NAME]",
+        "message_text": false,
+        'message_box_text': "Email Invite Expired"
+      }
+    ];
+
+    var $infoBox = $('.hf-custom-textarea_content_39,.hf-custom-textarea_content_249').first();
+    var $nameBox = $('.hf-user-profile_name');
+    // Inject "new ticket" button
+    $('.hf-top-article_5').before(newTicketButton);
+    if ($nameBox && $infoBox) {
+      var fullName = $nameBox.text();
+      $('body').on('DOMSubtreeModified', '#select2-id_category-container', function(){
+        var $subjectBox = $('#id_subject');
+        var $messageBox = $('.cke_wysiwyg_div');
+        var $messageText = $('#id_html').prev('label');
+        var cat_name = $('#select2-id_category-container').text();
+        var info_html = default_info_html;
+        var message_text = default_message_text;
+        var subject_text = default_subject_text;
+        var message_box_text = default_message_box_text;
+        for (let i = 0; i < custom_temmplates.length; i++) {
+          if (cat_name == custom_temmplates[i]['cat_name']) {
+            if (custom_temmplates[i]['message_text']) {
+              message_text = custom_temmplates[i]['message_text'];
+            }
+            if (custom_temmplates[i]['subject_text']) {
+              subject_text = custom_temmplates[i]['subject_text'];
+            }
+            if (custom_temmplates[i]['message_box_text']) {
+              message_box_text = custom_temmplates[i]['message_box_text'];
+            }
+            if (custom_temmplates[i]['info_html']) {
+              info_html = custom_temmplates[i]['info_html'];
+            }
+            break;
+          }
+        }
+        if ($subjectBox) {
+          $subjectBox.val(subject_text);
+        }
+        if ($messageText) {
+          $messageText.html(message_text);
+        }
+        if ($messageBox && $messageBox.text().length < 32) {
+          if (message_box_text) {
+            $messageBox.html('<p>' + message_box_text + '.</p>');
+          } else {
+            $messageBox.html('');
+          }
+        }
+        $infoBox.html(info_html);
+      });
+    }
+  });
+</script>

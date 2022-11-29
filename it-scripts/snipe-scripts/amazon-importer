@@ -1,0 +1,624 @@
+#!/usr/local/bin/python3
+#
+# User /bin/python3 for typical systems
+
+# Import all the things
+import csv
+import json
+import requests
+import time
+import configparser
+import argparse
+import logging
+import os
+import re
+import math
+import string
+import sys
+
+usd_exchange_rate = 1.27
+
+class EnvironmentInterpolation(configparser.BasicInterpolation):
+    def before_get(self, parser, section, option, value, defaults):
+        value = super().before_get(parser, section, option, value, defaults)
+        return os.path.expandvars(value)
+
+# Set us up for using runtime arguments by defining them.
+runtimeargs = argparse.ArgumentParser()
+runtimeargs.add_argument("-v", "--verbose", help="Sets the logging level to INFO and gives you a better idea of what the script is doing.", action="store_true")
+runtimeargs.add_argument("--dryrun", help="This checks your config and tries to contact both the JAMFPro and Snipe-it instances, but exits before updating or syncing any assets.", action="store_true")
+runtimeargs.add_argument("-d", "--debug", help="Sets logging to include additional DEBUG messages.", action="store_true")
+runtimeargs.add_argument("--update_jamf", help="Updates JAMF with the asset tags stored in Snipe.", action="store_true")
+runtimeargs.add_argument('--do_not_verify_ssl', help="Skips SSL verification for all requests. Helpful when you use self-signed certificate.", action="store_false")
+runtimeargs.add_argument("-r", "--ratelimited", help="Puts a half second delay between Snipe IT API calls to adhere to the standard 120/minute rate limit", action="store_true")
+runtimeargs.add_argument("-f", "--force", help="Updates the Snipe asset with information from Jamf every time, despite what the timestamps indicate.", action="store_true")
+user_opts = runtimeargs.add_mutually_exclusive_group()
+user_opts.add_argument("-u", "--users", help="Checks out the item to the current user in Jamf if it's not already deployed", action="store_true")
+user_opts.add_argument("-ui", "--users_inverse", help="Checks out the item to the current user in Jamf if it's already deployed", action="store_true")
+user_opts.add_argument("-uf", "--users_force", help="Checks out the item to the user specified in Jamf no matter what", action="store_true")
+user_opts.add_argument("-uns", "--users_no_search", help="Doesn't search for any users if the specified fields in Jamf and Snipe don't match. (case insensitive)", action="store_true")
+type_opts = runtimeargs.add_mutually_exclusive_group()
+type_opts.add_argument("-m", "--mobiles", help="Runs against the JAMF and Google mobiles endpoints only.", action="store_true")
+type_opts.add_argument("-c", "--computers", help="Runs against the JAMF computers endpoint only.", action="store_true")
+user_args = runtimeargs.parse_args()
+
+# Notify users they're going to get a wall of text in verbose mode.
+if user_args.verbose:
+    logging.basicConfig(level=logging.INFO)
+elif user_args.debug:
+    logging.basicConfig(level=logging.DEBUG)
+else:
+    logging.basicConfig(level=logging.WARNING)
+
+# Notify users if we're doing a dry run.
+if user_args.dryrun:
+    print("Dryrun: Starting amazon-importer in dry run mode, nothing will be updated.")
+
+# Find a valid settings.conf file.
+logging.info("Searching for a valid settings.conf file.")
+config = configparser.ConfigParser(interpolation=EnvironmentInterpolation())
+logging.debug("Checking for a settings.conf in /opt/snipe-importer...")
+config.read("/opt/snipe-importer/settings.conf")
+if 'snipe-it' not in set(config):
+    logging.debug("No valid config found in: /opt Checking for a settings.conf in /etc/snipe-importer ...")
+    config.read('/etc/snipe-importer/settings.conf')
+if 'snipe-it' not in set(config):
+    logging.debug("No valid config found in /etc Checking for a settings.conf in current directory ...")
+    config.read("settings.conf")
+if 'snipe-it' not in set(config):
+    logging.debug("No valid config found in current folder.")
+    logging.error("No valid settings.conf was found. We'll need to quit while you figure out where the settings are at. You can check the README for valid locations.")
+    raise SystemExit("Error: No valid settings.conf - Exiting.")
+
+logging.info("Great, we found a settings file. Let's get started by parsing all fo the settings.")
+
+csv_files = config['snipe-it']['amazon_csv_files'].split(',')
+amazon_ca_id = int(config['snipe-it']['amazon_ca_supplier_id'])
+amazon_us_id = int(config['snipe-it']['amazon_us_supplier_id'])
+snipe_mobile_id = int(config['snipe-it']['mobile_model_category_id'])
+snipe_mobile_fields_id = int(config['snipe-it']['mobile_custom_fieldset_id'])
+
+# This is the address, cname, or FQDN for your snipe-it instance.
+snipe_base = config['snipe-it']['url']
+snipe_api_key = config['snipe-it']['apiKey']
+
+# Headers for the API call.
+logging.info("Creating the headers we'll need for API calls")
+snipeheaders = {'Authorization': 'Bearer {}'.format(snipe_api_key), 'Accept': 'application/json','Content-Type':'application/json'}
+
+
+### Setup Some Functions ###
+snipe_api_count = 0
+first_snipe_call = None
+# This function is run every time a request is made, handles rate limiting for Snipe IT.
+def request_handler(r, *args, **kwargs):
+    global snipe_api_count
+    global first_snipe_call
+    if (snipe_base in r.url) and user_args.ratelimited:
+        if '"messages":429' in r.text:
+            logging.warn("Despite respecting the rate limit of Snipe, we've still been limited. Trying again after sleeping for 2 seconds.")
+            time.sleep(2)
+            re_req = r.request
+            s = requests.Session()
+            return s.send(re_req)
+        if snipe_api_count == 0:
+            first_snipe_call = time.time()
+            time.sleep(0.5)
+        snipe_api_count += 1
+        time_elapsed = (time.time() - first_snipe_call)
+        snipe_api_rate = snipe_api_count / time_elapsed
+        if snipe_api_rate > 1.95:
+            sleep_time = 0.5 + (snipe_api_rate - 1.95)
+            logging.debug('Going over snipe rate limit of 120/minute ({}/minute), sleeping for {}'.format(snipe_api_rate,sleep_time))
+            time.sleep(sleep_time)
+        logging.debug("Made {} requests to Snipe IT in {} seconds, with a request being sent every {} seconds".format(snipe_api_count, time_elapsed, snipe_api_rate))
+    if '"messages":429' in r.text:
+        logging.error(r.content)
+        raise SystemExit("We've been rate limited. Use option -r to respect the built in Snipe IT API rate limit of 120/minute.")
+    return r
+
+def request_handler(r, *args, **kwargs):
+    global snipe_api_count
+    global first_snipe_call
+    if (snipe_base in r.url) and user_args.ratelimited:
+        if '"messages":429' in r.text:
+            logging.warn("Despite respecting the rate limit of Snipe, we've still been limited. Trying again after sleeping for 2 seconds.")
+            time.sleep(2)
+            re_req = r.request
+            s = requests.Session()
+            return s.send(re_req)
+        if snipe_api_count == 0:
+            first_snipe_call = time.time()
+            time.sleep(0.5)
+        snipe_api_count += 1
+        time_elapsed = (time.time() - first_snipe_call)
+        snipe_api_rate = snipe_api_count / time_elapsed
+        if snipe_api_rate > 1.95:
+            sleep_time = 0.5 + (snipe_api_rate - 1.95)
+            logging.debug('Going over snipe rate limit of 120/minute ({}/minute), sleeping for {}'.format(snipe_api_rate,sleep_time))
+            time.sleep(sleep_time)
+        logging.debug("Made {} requests to Snipe IT in {} seconds, with a request being sent every {} seconds".format(snipe_api_count, time_elapsed, snipe_api_rate))
+    if '"messages":429' in r.text:
+        logging.error(r.content)
+        raise SystemExit("We've been rate limited. Use option -r to respect the built in Snipe IT API rate limit of 120/minute.")
+    return r
+    
+
+# Function to get all item of a certain type (models/licenses)
+def get_snipe_list(list_type, limit=200, offset=0, last_response=False):
+    api_url = '{}/api/v1/{}?limit={}&offset={}'.format(snipe_base, list_type, limit, offset)
+    logging.info('Calling against: {}'.format(api_url))
+    response = requests.get(api_url, headers=snipeheaders, verify=user_args.do_not_verify_ssl, hooks={'response': request_handler})
+    if response.status_code == 200:
+
+        jsonresponse = response.json()
+
+        if 'rows' in jsonresponse:
+            count = len(jsonresponse['rows'])
+
+            logging.info("Got a valid response that should have {} of {} {}.".format(count, jsonresponse['total'], list_type))
+
+            if last_response:
+                jsonresponse['rows'] = last_response['rows'] + jsonresponse['rows']
+
+            if (count < limit):
+                return jsonresponse
+            else:
+                return get_snipe_list(list_type, limit, offset + count, jsonresponse)
+        else:
+
+            logging.warning('Error code: Invalid payload')
+
+            if last_response:
+                return last_response
+            else:
+                return False
+
+    else:
+
+        logging.warning('Error code: {} while trying to create a new manufacturer.'.format(response.status_code))
+        return False
+
+
+
+
+# Recursive function returns all users in a Snipe Instance, 100 at a time.
+def get_snipe_users(previous=[]):
+    user_id_url = '{}/api/v1/users'.format(snipe_base)
+    payload = {
+        'limit': 100,
+        'offset': len(previous)
+    }
+    logging.debug('The payload for the snipe users GET is {}'.format(payload))
+    response = requests.get(user_id_url, headers=snipeheaders, json=payload, hooks={'response': request_handler})
+    response_json = response.json()
+    current = response_json['rows']
+    if len(previous) != 0:
+        current = previous + current
+    if response_json['total'] > len(current):
+        logging.debug('We have more than 100 users, get the next page - total: {} current: {}'.format(response_json['total'], len(current)))
+        return get_snipe_users(current)
+    else:
+        return current
+
+# Function to create a manufacturer in Snipe
+def create_snipe_manufacturer(name):
+    global snipemanufacturers
+    if name == '':
+        return False
+    api_url = '{}/api/v1/manufacturers'.format(snipe_base)
+    payload = {
+        'name': name
+    }
+    logging.debug('Calling to create new snipe license type against: {}\nThe payload for the POST request is:{}\nThe request headers can be found near the start of the output.'.format(api_url, payload))
+    response = requests.post(api_url, headers=snipeheaders, json=payload, verify=user_args.do_not_verify_ssl, hooks={'response': request_handler})
+    if response.status_code == 200:
+        logging.info("Created manufacturer '{}'.".format(name)) 
+        jsonresponse = response.json()
+        if jsonresponse and 'payload' in jsonresponse and jsonresponse['payload'] is not None and 'id' in jsonresponse['payload']:
+            snipemanufacturers['rows'].append(jsonresponse['payload'])
+            return jsonresponse['payload']['id']
+        else:
+            return False
+    else:
+        logging.warning('Error code: {} while trying to create a new manufacturer.'.format(response.status_code))
+        return False
+
+# Function to get a manufacturer id in Snipe
+def get_snipe_manufacturer_id(name):
+    for manufacturer in snipemanufacturers['rows']:
+        if manufacturer['name'].lower() == name.lower():
+            return manufacturer['id']
+    return False
+
+# Function to search snipe for a user
+def get_snipe_user_id(name):
+    if name == '' or not name:
+        return False
+    name = name.lower()
+    is_username = ' ' not in name
+    for user in snipeusers:
+        if (is_username and user['username'].lower() == name) or (not is_username and user['name'].lower() == name):
+            return user['id']
+    return False
+
+def update_snipe_user_note(user_id, note):
+    api_url = '{}/api/v1/users/{}'.format(snipe_base, user_id)
+    payload = {'notes': note}
+    logging.info("Updating note for user id {}".format(user_id))
+    response = requests.patch(api_url, headers=snipeheaders, json=payload, verify=user_args.do_not_verify_ssl, hooks={'response': request_handler})
+    if response.status_code == 200:
+        return True
+    else:
+        logging.error('Category creation failed with error {}'.format(response.text))
+        return False
+
+def get_snipe_category_id(name):
+    if 'rows' in snipecategories:
+        for category in snipecategories['rows']:
+            if category['name'] == name:
+                return category['id']
+    else:
+        return False
+
+def create_snipe_category(payload):
+    global snipecategories
+    api_url = '{}/api/v1/categories'.format(snipe_base)
+    logging.info("Creating category '{}'".format(payload['name']))
+    logging.debug('Calling to create a new category against: {}\nThe payload for the POST request is:{}\nThe request headers can be found near the start of the output.'.format(api_url, payload))
+    response = requests.post(api_url, headers=snipeheaders, json=payload, verify=user_args.do_not_verify_ssl, hooks={'response': request_handler})
+    logging.debug(response.text)
+    if response.status_code == 200:
+        logging.debug("Got back status code: 200 - {}".format(response.content))
+        jsonresponse = response.json()
+        if 'payload' in jsonresponse and jsonresponse['payload'] is not None:
+            if 'rows' in snipecategories:
+                snipecategories['rows'].append(jsonresponse['payload'])
+            else:
+                snipecategories = {'rows': [jsonresponse['payload']]}
+            return jsonresponse['payload']['id']
+        else:
+            logging.error('Missing payload')
+            return False
+    else:
+        logging.error('Category creation failed with error {}'.format(response.text))
+        return False
+
+
+def get_snipe_accessory_id(order_no, name = False):
+    if 'rows' in snipeaccesories:
+        for accessory in snipeaccesories['rows']:
+            if accessory['order_number'] is not None and ((name and accessory['order_number'] == order_no and accessory['name'] == name) or (not name and accessory['order_number'] == order_no)):
+                return accessory['id']
+    return False
+
+def get_snipe_accessory_idx(order_no, name):
+    if 'rows' in snipeaccesories:
+        c = 0
+        for accessory in snipeaccesories['rows']:
+            if accessory['order_number'] is not None and accessory['order_number'] == order_no and accessory['name'] == name:
+                return c
+            c = c + 1
+    return -1
+
+def create_snipe_accessory(payload):
+    global snipeaccesories
+    api_url = '{}/api/v1/accessories'.format(snipe_base)
+    logging.info("Creating accessory '{}'".format(payload['name']))
+    logging.debug('Calling to create a new accessory against: {}\nThe payload for the POST request is:{}\nThe request headers can be found near the start of the output.'.format(api_url, payload))
+    response = requests.post(api_url, headers=snipeheaders, json=payload, verify=user_args.do_not_verify_ssl, hooks={'response': request_handler})
+    logging.debug(response.text)
+    if response.status_code == 200:
+        logging.debug("Got back status code: 200 - {}".format(response.content))
+        jsonresponse = response.json()
+        if 'payload' in jsonresponse and jsonresponse['payload'] is not None:
+            if 'rows' in snipeaccesories:
+                snipeaccesories['rows'].append(jsonresponse['payload'])
+            else:
+                snipeaccesories = {'rows': [jsonresponse['payload']]}
+            return len(snipeaccesories['rows']) - 1
+        else:
+            logging.error('Missing payload')
+            return False
+    else:
+        logging.error('Accessory creation failed with error {}'.format(response.text))
+        print(payload)
+        return False
+
+def update_snipe_accessory(accesory_id, payload):
+    api_url = '{}/api/v1/accessories/{}'.format(snipe_base, accesory_id)
+    logging.info("Updating accessory id {}".format(accesory_id))
+    response = requests.put(api_url, headers=snipeheaders, json=payload, verify=user_args.do_not_verify_ssl, hooks={'response': request_handler})
+    if response.status_code == 200:
+        logging.debug("Got back status code: 200 - {}".format(response.content))
+        return True
+    else:
+        logging.error('Accessory update failed with error {}'.format(response.text))
+        print(payload)
+        return False
+
+def get_snipe_accesory_seats2(id):
+    api_url = '{}/api/v1/accessories/{}/checkedout'.format(snipe_base, id)
+    response = requests.get(api_url, headers=snipeheaders, verify=user_args.do_not_verify_ssl, hooks={'response': request_handler})
+    if response.status_code == 200:
+        jsonresponse = response.json()
+        if 'rows' in jsonresponse and len(jsonresponse['rows']) > 0:
+            return jsonresponse['rows']
+        else:
+            return []
+            
+    else:
+        logging.error('When we tried to retreive a list of license seats, Snipe-IT responded with error status code: {} - {}'.format(response.status_code, response.content))
+        raise SystemExit("Snipe license seats API endpoint failed.")
+
+def get_snipe_accesory_seats(id):
+
+    def process_response(r):
+        seats = {'users': {}, 'assets': {}}
+        for seat in r['rows']:
+            if seat['assigned_user'] is not None:
+                seats['users'][seat['id']] = seat['assigned_user']['id'] + 10
+            elif seat['assigned_asset'] is not None:
+                seats['users'][seat['id']] = seat['assigned_asset']['id'] + 10
+        return seats
+
+    api_url = '{}/api/v1/accessories/{}/seats'.format(snipe_base, id)
+    response = requests.get(api_url, headers=snipeheaders, verify=user_args.do_not_verify_ssl, hooks={'response': request_handler})
+    if response.status_code == 200:
+        jsonresponse = response.json()
+        logging.info("Got a valid response that should have {}.".format(jsonresponse['total']))
+        if jsonresponse['total'] <= len(jsonresponse['rows']) :
+            return jsonresponse
+        else:
+            logging.info("We didn't get enough results so we need to get them again.")
+            api_url = '{}/api/v1/licenses/{}/seats?limit={}'.format(snipe_base, id, jsonresponse['total'])
+            newresponse = requests.get(api_url, headers=snipeheaders, verify=user_args.do_not_verify_ssl, hooks={'response': request_handler})
+            if newresponse.status_code == 200:
+                newjsonresponse = newresponse.json()
+                if newjsonresponse['total'] == len(newjsonresponse['rows']) :
+                    return newjsonresponse
+                else:
+                    logging.error("We couldn't seem to get all of the seats for the license")
+                    raise SystemExit("Unable to get all seat objects from Snipe-IT instanace")
+            else:
+                logging.error('When we tried to retreive a list of license seats, Snipe-IT responded with error status code: {} - {}'.format(response.status_code, response.content))
+                raise SystemExit("Snipe models API endpoint failed.")
+    else:
+        logging.error('When we tried to retreive a list of license seats, Snipe-IT responded with error status code: {} - {}'.format(response.status_code, response.content))
+        raise SystemExit("Snipe license seats API endpoint failed.")
+
+def get_snipe_seats2():
+    seats = {}
+    for accesory in snipeaccesories['rows']:
+        seats[accesory['id']] = get_snipe_accesory_seats(accesory['id'])
+    return seats
+
+def is_snipe_accessory_checked_out(id):
+    api_url = '{}/api/v1/accessories/{}/checkedout'.format(snipe_base, id)
+    response = requests.get(api_url, headers=snipeheaders, verify=user_args.do_not_verify_ssl, hooks={'response': request_handler})
+    if response.status_code == 200:
+        jsonresponse = response.json()
+        return jsonresponse
+    return {'total': 0, 'rows': []}
+
+def checkout_snipe_accessory(id, user_id):
+    payload = {'assigned_to': user_id, 'note': 'Automatically checked out.'}
+    logging.info("Checking out accessory id {} to user id {}".format(id, user_id))
+    api_url = '{}/api/v1/accessories/{}/checkout'.format(snipe_base, id)
+    response = requests.post(api_url, headers=snipeheaders, json=payload, verify=user_args.do_not_verify_ssl, hooks={'response': request_handler})
+    if response.status_code == 200:
+        return True
+    else:
+        return False
+
+# Function that creates a new Snipe Model - not an asset - with a JSON payload
+def create_snipe_model(payload):
+    global modelnumbers
+
+    api_url = '{}/api/v1/models'.format(snipe_base)
+    response = requests.post(api_url, headers=snipeheaders, json=payload, verify=user_args.do_not_verify_ssl, hooks={'response': request_handler})
+    if response.status_code == 200:
+        jsonresponse = response.json()
+        modelnumbers[jsonresponse['payload']['model_number']] = jsonresponse['payload']['id']
+        return True
+    else:
+        print("Error code: {} while trying to create a new Snipe-IT model.".format(response.status_code))
+        return False
+
+
+snipemodels = get_snipe_list('models')
+snipefields = get_snipe_list('fields')
+snipeaccesories = get_snipe_list('accessories')
+snipecategories = get_snipe_list('categories')
+snipemanufacturers = get_snipe_list('manufacturers')
+
+
+modelnumbers = {}
+for model in snipemodels['rows']:
+    if model['model_number'] == "":
+        continue
+    modelnumbers[model['model_number']] = model['id']
+
+# Build array of known usernames
+snipeusers = get_snipe_users()
+# print(snipeusers)
+tmp_users = []
+for user in snipeusers:
+    user_obj = {'id': user['id'], 'username': user['username'], 'name': user['name'], 'last_updated': 0, 'notes' : user['notes']}
+    if 'updated_at' in user and user['updated_at'] is not None:
+        user_obj['last_updated'] = user['updated_at']['datetime']
+    tmp_users.append(user_obj)
+snipeusers = tmp_users
+
+orders = []
+for csv_file in csv_files:
+    if os.path.isfile(csv_file):
+        with open(csv_file, encoding='utf-8') as f:
+            if 'ca' in csv_file:
+                code = 'CA'
+            else:
+                code = 'US'
+            csv_reader = csv.DictReader(f)
+            for row in csv_reader:
+                order = {'item_quantity': 1, 'code': code, 'order_status': 'Unknown', 'commodity': '', 'item_model_number': ''}
+                for col in row:
+                    s_col = col.lower().strip().replace(' ', '_').replace('\ufeff', '')
+                    if s_col == 'purchase_ppu' or s_col == 'commodity' or s_col == 'order_status' or s_col == 'order_date' or s_col == 'order_id' or s_col == 'item_quantity' or s_col == 'title' or s_col == 'brand' or s_col == 'manufacturer' or s_col == 'class' or s_col == 'item_model_number' or s_col == 'account_user_email' or s_col == 'part_number':
+                        v = row[col]
+                        if s_col == 'order_date':
+                            v = v.split('/')
+                            if code == 'US':
+                                v = '{}-{}-{}'.format(v[2], v[0], v[1])
+                            else:
+                                v = '{}-{}-{}'.format(v[0], v[1], v[2])
+                        if s_col == 'item_quantity':
+                            v = int(v)
+                        if s_col == 'purchase_ppu':
+                            if code == 'US':
+                                v = round(float(v) * usd_exchange_rate, 2)
+                            else:
+                                v = round(float(v), 2)
+                        elif s_col == 'title':
+                            v = v.split(',')[0].split(' (')[0].replace(';', ' - ').split(' - ')[0].replace('"', 'in.')
+                            v = v.strip()
+                            v = v.split(' ')
+                            v = v[:7]
+                            v = ' '.join(v)
+                        order[s_col] = v
+                if order['order_status'] == 'Closed':
+                    orders.append(order)
+
+# print(orders)
+
+added_count = 0
+for order in orders:
+
+    min_price = 0
+
+    lower_commodity = order['commodity'].lower()
+
+    # print('{} - {}'.format(order['order_id'], order['purchase_ppu']))
+
+    if order['purchase_ppu'] >= min_price:
+
+        if ' ' in order['manufacturer'] and ' ' not in order['brand']:
+            manufacturer = order['brand']
+        else:
+            manufacturer = order['manufacturer']
+        manufacturer_id = get_snipe_manufacturer_id(manufacturer)
+        if not manufacturer_id:
+            manufacturer_id = create_snipe_manufacturer(manufacturer)
+
+        if manufacturer_id:
+
+            if lower_commodity == 'mobile phones':
+
+                if order['item_model_number'] != "":
+
+                    if order['item_model_number'] not in modelnumbers:
+                        # logging.info("Could not find a model ID in snipe for: {}".format(jamf['general']['model_identifier']))
+                        newmodel = {"category_id": int(snipe_mobile_fields_id), "manufacturer_id": manufacturer_id, "name": order['title'], "model_number": order['item_model_number']}
+                        if snipe_mobile_fields_id:
+                            newmodel['fieldset_id'] = int(snipe_mobile_fields_id)
+                        create_snipe_model(newmodel)
+
+
+
+            else:
+
+                accessory_idx = get_snipe_accessory_idx(order['order_id'], order['title'])
+
+                #if accessory_idx >= 0:
+
+                #    accessory_id = get_snipe_accessory_id(order['order_id'], order['title'])
+                #    if accessory_id:
+                #        payload = {'purchase_cost': round(order['purchase_ppu'], 2)}
+                #        update_snipe_accessory(accessory_id, payload)
+
+                #elif accessory_idx == -1 and order['part_number'] is not None and order['part_number'] != '':
+                if accessory_idx == -1 and order['part_number'] is not None and order['part_number'] != '':
+                    
+                    lower_title = order['title'].lower()
+                    
+                    category_name = 'Peripheral'
+                    if lower_commodity == 'liquid crystal display lcd panels or monitors':
+                        category_name = 'Monitor'
+
+                    cat_id = get_snipe_category_id(category_name)
+                    if not cat_id:
+                        payload = {'name': category_name, 'category_type': 'accessory'}
+                        cat_id = create_snipe_category(payload)
+        
+                    if cat_id and 'order_date' in order:
+                        
+                        if order['code'] == 'CA':
+                            supplier_id = amazon_ca_id
+                        else:
+                            supplier_id = amazon_us_id
+                        
+                        payload = {'name': order['title'], 'qty': order['item_quantity'], 'order_number': order['order_id'], 'purchase_date': order['order_date'], 'purchase_cost': round(order['purchase_ppu'] * order['item_quantity'], 2), 'category_id': cat_id, 'manufacturer_id': manufacturer_id, 'supplier_id': supplier_id}
+                        accessory_idx = create_snipe_accessory(payload)
+                        added_count = added_count + 1
+                        #print(payload)
+
+                        user_id = get_snipe_user_id(order['account_user_email'])
+
+                        #accessory_idx - 1
+                        #user_id = False
+
+                        if accessory_idx >= 0 and user_id:
+
+                            snipeaccesories['rows'][accessory_idx]['remaining_qty'] = order['item_quantity']
+                            
+                            checkout_state = is_snipe_accessory_checked_out(snipeaccesories['rows'][accessory_idx]['id'])
+                            checked_out_to_user = False
+                            for checkout in checkout_state['rows']:
+                                if checkout['id'] == user_id:
+                                    checked_out_to_user = True
+                                    continue
+                            # if not checked_out_to_user and snipeaccesories['rows'][accessory_idx]['remaining_qty'] > 0:
+                            if not checked_out_to_user:
+                                qty = snipeaccesories['rows'][accessory_idx]['remaining_qty']
+                                for x in range(qty):
+                                    checkout_snipe_accessory(snipeaccesories['rows'][accessory_idx]['id'], user_id)
+
+print("Collating costs...may take a while...")
+user_cost = {}
+for user in snipeusers:
+    user_cost[user['id']] = 0.0
+
+if added_count > 0:
+    snipeaccesories = get_snipe_list('accessories')
+
+for accesory in snipeaccesories['rows']:
+    if accesory['qty'] > 0 and accesory['remaining_qty'] < accesory['qty']:
+        checkedout = get_snipe_accesory_seats2(accesory['id'])
+        # checkedout = False
+        if checkedout and len(checkedout) > 0:
+            for user in checkedout:
+                user_id = user['id']
+                if accesory['purchase_cost'] is not None and accesory['purchase_cost'] and float(accesory['purchase_cost'].replace(',', '')) > 0:
+                    cost = float(accesory['purchase_cost'].replace(',', ''))
+                    if user_id in user_cost:
+                        user_cost[user_id] = user_cost[user_id] + cost
+
+cost_prefix = 'Combined accessory cost:'
+total_cost = 0.0
+total_users = 0
+for user in snipeusers:
+    current_note = ''
+    new_note = ''
+    if user['notes'] and user['notes'] != '':
+        current_note = user['notes']
+    if user_cost[user['id']] > 0:
+        cost_string = '${:,.2f} CAD'.format(user_cost[user['id']])
+        new_note = '{} {}'.format(cost_prefix, cost_string)
+        total_cost = total_cost + user_cost[user['id']]
+        total_users = total_users + 1
+    elif cost_prefix in current_note:
+        new_note = '{} $0 CAD'.format(cost_prefix)
+
+    if new_note != '' and new_note != current_note:
+        update_snipe_user_note(user['id'], new_note)
+average_cost = total_cost / total_users
+print('{} users have a combined total of ${:,.2f} CAD of accessories, with an average per user of ${:,.2f} CAD.'.format(total_users, total_cost, average_cost))

@@ -1,0 +1,32 @@
+
+import requests
+import json
+
+api_key = ''
+headers = {'Authorization': 'SSWS {}'.format(api_key), 'Accept': 'application/json'}
+
+get_groups = 'https://axiomzenportfolio.okta.com/api/v1/groups'
+get_users = 'https://axiomzenportfolio.okta.com/api/v1/users'
+get_apps = 'https://axiomzenportfolio.okta.com/api/v1/apps'
+
+
+groups = []
+users = []
+apps = []
+
+def api_pull(address,type):
+    response = requests.get('{}?limit=200'.format(address), headers = headers)
+    if response.status_code == 200:
+        type = type + response.json()
+        last_id = type[-1]['id']
+        response = requests.get('{}'.format(address, last_id), headers = headers)
+        if response.status_code == 200:
+            type = type + response.json()
+            print(type)
+        else:
+            print(response.content)
+            print(response)
+
+api_pull(get_groups,groups)
+api_pull(get_users,users)
+api_pull(get_apps,apps)

@@ -1,0 +1,57 @@
+textarea#t-cf-14,
+textarea#t-cf-17,
+textarea#t-cf-21,
+textarea#t-cf-47,
+textarea#t-cf-31,
+textarea#t-cf-37,
+textarea#t-cf-70,
+textarea#t-cf-71,
+textarea#t-cf-53,
+textarea#t-cf-51,
+textarea#t-cf-41,
+textarea#t-cf-62,
+textarea#t-cf-77,
+textarea#t-cf-64,
+textarea#t-cf-95,
+textarea#t-cf-93,
+textarea#t-cf-89,
+textarea#t-cf-97,
+textarea#t-cf-109
+{
+   height: 200px;
+}
+  
+#cke_1_contents {
+  height: 200px !important;
+}
+
+.hf-custom-textarea_content_39,
+.hf-custom-textarea_content_249 {
+ 	text-align: left !important;
+}
+.hf-form-field {
+  margin-top: 40px;
+}
+.button-container {
+	margin-left: 50%;
+  	padding: 40px 0px;
+}
+.ticket-button {
+  	background: #ed6c9f;
+  	font-size: 20px;
+	display: block;
+ 	cursor: pointer;
+  	text-align: center;
+  	width: 200px;
+  	margin-left: -100px;
+  	height: 60px;
+    line-height: 60px;
+  	border: 2px solid #f95e97;
+  	border-radius: 10px;
+}
+.ticket-button, .ticket-button:hover, .ticket-button:visited {
+ 	color: white;
+}
+.ticket-button:hover {
+  background: #f95e97;
+}
